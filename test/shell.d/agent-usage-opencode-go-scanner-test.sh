@@ -11,13 +11,13 @@ trap 'rm -rf "$TEST_HOME"' EXIT
 # Without credentials the collector must still print a full, hidden-by-default
 # record: the update runner writes whatever valid JSON appears on stdout.
 no_key=$(HOME="$TEST_HOME" XDG_DATA_HOME="$TEST_HOME/.local/share" XDG_CACHE_HOME="$TEST_HOME/.cache" \
-  OPENCODE_API_KEY="" "$ROOT/bin/omarchy-agent-usage-opencode")
+  OPENCODE_API_KEY="" "$ROOT/bin/omarchy-agent-usage-opencode-go")
 
 [[ $(jq -r '.id + ":" + (.ready | tostring) + ":" + .name + ":" + .tierLabel' <<<"$no_key") == "opencode:false:OpenCode:Go" ]] ||
   fail "OpenCode collector prints a valid record without credentials" "$no_key"
 pass "OpenCode collector prints a valid record without credentials"
 
-result=$(python3 - "$ROOT/bin/omarchy-agent-usage-opencode" "$TEST_HOME" <<'PY'
+result=$(python3 - "$ROOT/bin/omarchy-agent-usage-opencode-go" "$TEST_HOME" <<'PY'
 import importlib.machinery
 import importlib.util
 import json
@@ -467,7 +467,7 @@ PY
 )
 
 [[ $(jq -r '.record | {schemaVersion, id, name, ready, hasLocalStats, scope, hasPromptStats, tierLabel} | tostring' <<<"$result") == \
-  '{"schemaVersion":1,"id":"opencode","name":"OpenCode","ready":true,"hasLocalStats":true,"scope":"device","hasPromptStats":true,"tierLabel":"Go"}' ]] ||
+  '{"schemaVersion":1,"id":"opencode-go","name":"OpenCode","ready":true,"hasLocalStats":true,"scope":"device","hasPromptStats":true,"tierLabel":"Go"}' ]] ||
   fail "OpenCode collector prints the display-ready record contract" "$result"
 pass "OpenCode collector prints the display-ready record contract"
 
