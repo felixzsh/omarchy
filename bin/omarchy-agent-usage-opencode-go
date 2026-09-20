@@ -64,7 +64,7 @@ def local_date_string() -> str:
 def number(value: Any) -> int:
   try:
     n = float(value or 0)
-    return round(n) if n == n else 0
+    return max(0, round(n)) if n == n else 0
   except Exception:
     return 0
 
@@ -248,10 +248,10 @@ def scan_opencode_db(db: Path) -> tuple[dict[str, Any], bool]:
           today_token_total += total
           today_tokens[model] = today_tokens.get(model, 0) + total
 
-    if "message" in tables:
-      scan_table(True)
     if "session_message" in tables:
       scan_table(False)
+    if "message" in tables:
+      scan_table(True)
   except sqlite3.Error:
     complete = False
   finally:
@@ -336,7 +336,8 @@ def read_cached_stats(cache_file: Path, max_age_seconds: float) -> dict[str, Any
   stats = cached.get("stats")
   if not isinstance(stats, dict):
     return None
-  if not all(key in stats for key in ("todayPrompts", "todayTotalTokens", "recentDays", "activeDates", "modelUsage")):
+  required = ("todayPrompts", "todayTotalTokens", "recentDays", "activeDates", "modelUsage")
+  if not all(key in stats for key in required):
     return None
   return stats
 
@@ -351,7 +352,10 @@ def cached_scan(db: Path, max_age_seconds: float) -> dict[str, Any]:
   try:
     return _cached_scan(db, max_age_seconds)
   except Exception as exc:
-    print(f"omarchy-agent-usage-opencode-go: cache unavailable ({exc}); scanning directly", file=sys.stderr)
+    print(
+      f"omarchy-agent-usage-opencode-go: cache unavailable ({exc}); scanning directly",
+      file=sys.stderr,
+    )
     stats, _ = scan_opencode_db(db)
     return stats
 
@@ -403,7 +407,7 @@ def read_sqlite_credential(db: Path) -> str:
     return ""
   try:
     rows = conn.execute(
-      "SELECT value FROM credential WHERE integration_id = ? "
+      "SELECT value FROM credential WHERE integration_id = ? AND active = 1 "
       "ORDER BY active DESC, time_updated DESC",
       ("opencode-go",),
     )
@@ -552,7 +556,8 @@ def parse_usage_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     # A rate-limited window is at 100% and its reset is what matters.
     if str(entry.get("status") or "") == "rate-limited":
       percent = 1.0
-    resets_at = str(entry.get("resetsAt") or "").strip() or reset_from_seconds(entry.get("resetInSec"))
+    resets_at = str(entry.get("resetsAt") or "").strip()
+    resets_at = resets_at or reset_from_seconds(entry.get("resetInSec"))
     out.append({"label": label, "percent": percent, "resetsAt": resets_at})
   return out
 
