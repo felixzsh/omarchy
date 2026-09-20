@@ -55,7 +55,7 @@ light surfaces — and the bar glyph stands in when there is none.
 | `claude` | Anthropic's OAuth usage endpoint (5-hour session + 7-day weekly) | `~/.claude/projects` transcripts, opencode sessions on an Anthropic provider, plus `stats-cache.json` and `history.jsonl` as fallback |
 | `codex` | The Codex app-server RPC | native Codex CLI session files (plus pi and opencode sessions) |
 | `fireworks` | Estimated prepaid balance: configured funding minus rated account costs | Fireworks billing API, grouped by day and model for the last 30 days |
-| `opencode` | OpenCode's official usage endpoint (rolling 5-hour, weekly, monthly) | opencode's own database, messages on the `opencode-go` provider |
+| `opencode-go` | OpenCode Go limits (5-hour, weekly, monthly) | OpenCode SQLite v1/v2 |
 
 Claude limits need a signed-in CLI; without credentials the panel says so and
 falls back to local stats only. A non-default Claude directory is honored via
@@ -63,7 +63,8 @@ falls back to local stats only. A non-default Claude directory is honored via
 `FIREWORKS_API_KEY` and `FIREWORKS_ACCOUNT_ID` first, then
 `~/.fireworks/auth.ini` (which `firectl set-api-key` creates), then the key
 opencode stores in `~/.local/share/opencode/auth.json` when Fireworks is
-signed in there. OpenCode reads `OPENCODE_API_KEY` first, then the
+signed in there. OpenCode Go reads `OPENCODE_API_KEY` first, then the active
+`opencode-go` credential in the selected SQLite database, and finally the
 `opencode-go` entry of that same `auth.json`.
 
 ### OpenCode Go limits
@@ -71,12 +72,22 @@ signed in there. OpenCode reads `OPENCODE_API_KEY` first, then the
 The collector asks `GET https://opencode.ai/zen/go/v1/usage` with the Go API
 key and shows the same rolling / weekly / monthly percentages the
 opencode.ai dashboard does, so the meters are authoritative account-wide —
-even for usage burned on other machines or in other harnesses. Local token
-stats are only what opencode recorded on this machine, like the claude and
-codex collectors. The endpoint is rate-limited on the server, so probes are
-reused for 15 seconds; a failed probe keeps the last successful numbers while
-their windows are still open — a rejected key says so in the panel — and one
-that cannot reach the server at all asks the panel to retry sooner.
+even for usage burned on other machines or in other harnesses. Percentages
+from 0 to 100 are normalized to the panel's 0 to 1 scale, including 0%.
+The collector accepts both the deployed `usage.<window>.percent/resetsAt`
+shape and the historical `<window>Usage.usagePercent/resetInSec` shape.
+Local token stats select `OPENCODE_DB`, then `opencode-v2.db` when present, and
+finally `opencode.db`. Within the selected database they read both SQLite
+generations (`message` and `session_message`) and deduplicate migrated rows by
+message ID. Future releases that use only `opencode.db` need no migration.
+
+The limits endpoint is rate-limited, so successful probes are reused for 15
+seconds. The limits cache is keyed by a hash of the selected API key; the local
+stats cache follows the selected database path. Neither is
+reused without a key or for another account. A failed probe keeps open cached
+windows, while transport and transient server failures ask the panel to retry.
+Expired, corrupt, and future-dated cache entries are discarded. `--force`
+bypasses both caches.
 
 ### Fireworks balance
 
@@ -142,7 +153,8 @@ edit `shell.json` directly):
 omarchy bar set omarchy.agents providers '{
   "claude": { "enabled": true },
   "codex": { "enabled": false },
-  "fireworks": { "enabled": true }
+  "fireworks": { "enabled": true },
+  "opencode-go": { "enabled": true }
 }' --json
 ```
 
