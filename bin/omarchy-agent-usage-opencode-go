@@ -19,6 +19,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -79,15 +80,81 @@ def empty_bucket() -> dict[str, int]:
 
 # ---------------------------------------------------------------- local scan
 #
-# opencode records one row per message in its database; every assistant
-# message that ran on the opencode-go provider carries the model, token
-# counts (cache and reasoning split out), and a millisecond timestamp. This
-# is the same database and the same shape the claude and codex collectors
-# read, just filtered to their own provider ids.
+# OpenCode has both the original message table and the newer session_message
+# table. Both carry assistant usage, but a migrated message can appear in both,
+# so rows are deduplicated by message id after filtering to opencode-go.
 
 
-def opencode_db_path() -> Path:
-  return data_home() / "opencode" / "opencode.db"
+def opencode_db_path() -> Path | None:
+  root = data_home() / "opencode"
+  configured = os.environ.get("OPENCODE_DB", "").strip()
+  if configured:
+    configured_path = Path(configured).expanduser()
+    return (configured_path if configured_path.is_absolute() else root / configured_path).resolve()
+  v2 = root / "opencode-v2.db"
+  if v2.is_file():
+    return v2
+  normal = root / "opencode.db"
+  return normal if normal.is_file() else None
+
+
+def parse_usage_message(
+  raw: str, legacy: bool, today: str
+) -> dict[str, Any] | None:
+  try:
+    entry = json.loads(raw)
+  except Exception:
+    return None
+  if not isinstance(entry, dict):
+    return None
+
+  if legacy:
+    if entry.get("role") != "assistant":
+      return None
+    provider = entry.get("providerID")
+    model_id = entry.get("modelID")
+  else:
+    model_info = entry.get("model")
+    if not isinstance(model_info, dict):
+      return None
+    provider = model_info.get("providerID")
+    model_id = model_info.get("id")
+  if str(provider or "") != "opencode-go":
+    return None
+
+  tokens = entry.get("tokens")
+  if not isinstance(tokens, dict):
+    return None
+  cache = tokens.get("cache") or {}
+  if not isinstance(cache, dict):
+    cache = {}
+  input_tokens = number(tokens.get("input"))
+  output_tokens = number(tokens.get("output")) + number(tokens.get("reasoning"))
+  cache_read = number(cache.get("read"))
+  cache_write = number(cache.get("write"))
+  total = input_tokens + output_tokens + cache_read + cache_write
+  if total <= 0:
+    return None
+
+  time_info = entry.get("time") or {}
+  if not isinstance(time_info, dict):
+    return None
+  created = number(time_info.get("created"))
+  day = (
+    dt.datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d")
+    if created > 0
+    else today
+  )
+  model = str(model_id or "opencode").rstrip("/").split("/")[-1]
+  return {
+    "day": day,
+    "model": model or "opencode",
+    "input": input_tokens,
+    "output": output_tokens,
+    "cacheRead": cache_read,
+    "cacheWrite": cache_write,
+    "total": total,
+  }
 
 
 def scan_opencode_db(db: Path) -> tuple[dict[str, Any], bool]:
@@ -111,69 +178,82 @@ def scan_opencode_db(db: Path) -> tuple[dict[str, Any], bool]:
     conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
   except sqlite3.Error:
     return empty_stats(), False
+  complete = True
   try:
     conn.execute("PRAGMA query_only = ON")
-    # The DB holds every historical message, JSON included, so filtering in
-    # SQL keeps tens-of-MB blobs out of Python. The json_extract conditions
-    # are the authority; the LIKE gates in front are pure acceleration (they
-    # differ only on duplicate keys or ASCII escapes, vanishingly rare), and
-    # the CASE guards keep json_extract — which raises on malformed JSON —
-    # from aborting the scan.
-    for session_id, raw in conn.execute(
-      "SELECT session_id, data FROM message"
-      " WHERE data LIKE '%\"role\"%:%\"assistant\"%'"
-      " AND data LIKE '%\"providerID\"%:%\"opencode-go\"%'"
-      " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.role') END = 'assistant'"
-      " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.providerID') END = 'opencode-go'"
-    ):
-      # One malformed row must not abort the scan, so every shape assumption
-      # lives inside the try.
-      try:
-        entry = json.loads(raw)
-        # Exact match: opencode provider ids are free-form, and a custom
-        # "opencode-proxy" gateway is not this subscription.
-        if not isinstance(entry, dict) or entry.get("role") != "assistant":
-          continue
-        if str(entry.get("providerID") or "") != "opencode-go":
-          continue
-        tokens = entry.get("tokens") or {}
-        cache = tokens.get("cache") or {}
-        input_tokens = number(tokens.get("input"))
-        # opencode keeps thinking tokens out of output; both are generated.
-        output_tokens = number(tokens.get("output")) + number(tokens.get("reasoning"))
-        cache_read = number(cache.get("read"))
-        cache_write = number(cache.get("write"))
-        total = input_tokens + output_tokens + cache_read + cache_write
-        if total <= 0:
-          continue
+    tables = {
+      name
+      for (name,) in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+      )
+    }
+    if not tables.intersection({"message", "session_message"}):
+      return empty_stats(), False
 
-        created = number((entry.get("time") or {}).get("created"))
-        day = dt.datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d") if created > 0 else today
-        model = str(entry.get("modelID") or "opencode").rstrip("/").split("/")[-1]
-      except Exception:
-        continue
-      session_key = "opencode:" + str(session_id)
-      sessions.add(session_key)
-      active_days.add(day)
-      prompts += 1
+    seen_message_ids: set[str] = set()
 
-      bucket = usage_by_model.setdefault(model, empty_bucket())
-      bucket["inputTokens"] += input_tokens
-      bucket["outputTokens"] += output_tokens
-      bucket["cacheReadInputTokens"] += cache_read
-      bucket["cacheCreationInputTokens"] += cache_write
+    def scan_table(legacy: bool) -> None:
+      nonlocal prompts, today_prompt_count, today_token_total
+      if legacy:
+        query = (
+          "SELECT id, session_id, data FROM message"
+          " WHERE data LIKE '%\"role\"%:%\"assistant\"%'"
+          " AND data LIKE '%\"providerID\"%:%\"opencode-go\"%'"
+          " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.role') END = 'assistant'"
+          " AND CASE WHEN json_valid(data) THEN "
+          "json_extract(data, '$.providerID') END = 'opencode-go'"
+        )
+      else:
+        query = (
+          "SELECT id, session_id, data FROM session_message"
+          " WHERE type = 'assistant'"
+          " AND data LIKE '%\"providerID\"%:%\"opencode-go\"%'"
+          " AND CASE WHEN json_valid(data) THEN "
+          "json_extract(data, '$.model.providerID') END = 'opencode-go'"
+        )
 
-      if day in recent:
-        # recentDays.messageCount is actually a token total, despite the
-        # legacy name shared with synced snapshots.
-        recent[day]["messageCount"] += total
-      if day == today:
-        today_prompt_count += 1
-        today_sessions.add(session_key)
-        today_token_total += total
-        today_tokens[model] = today_tokens.get(model, 0) + total
+      for message_id, session_id, raw in conn.execute(query):
+        try:
+          usage = parse_usage_message(raw, legacy, today)
+        except Exception:
+          continue
+        if usage is None or str(message_id) in seen_message_ids:
+          continue
+        seen_message_ids.add(str(message_id))
+        day = usage["day"]
+        model = usage["model"]
+        input_tokens = usage["input"]
+        output_tokens = usage["output"]
+        cache_read = usage["cacheRead"]
+        cache_write = usage["cacheWrite"]
+        total = usage["total"]
+        session_key = "opencode:" + str(session_id)
+        sessions.add(session_key)
+        active_days.add(day)
+        prompts += 1
+
+        bucket = usage_by_model.setdefault(model, empty_bucket())
+        bucket["inputTokens"] += input_tokens
+        bucket["outputTokens"] += output_tokens
+        bucket["cacheReadInputTokens"] += cache_read
+        bucket["cacheCreationInputTokens"] += cache_write
+
+        if day in recent:
+          # recentDays.messageCount is actually a token total, despite the
+          # legacy name shared by synced snapshots.
+          recent[day]["messageCount"] += total
+        if day == today:
+          today_prompt_count += 1
+          today_sessions.add(session_key)
+          today_token_total += total
+          today_tokens[model] = today_tokens.get(model, 0) + total
+
+    if "message" in tables:
+      scan_table(True)
+    if "session_message" in tables:
+      scan_table(False)
   except sqlite3.Error:
-    return empty_stats(), False
+    complete = False
   finally:
     conn.close()
 
@@ -188,7 +268,7 @@ def scan_opencode_db(db: Path) -> tuple[dict[str, Any], bool]:
     "activeDays": len(active_days),
     "activeDates": sorted(active_days),
     "modelUsage": usage_by_model,
-  }, True
+  }, complete
 
 
 def empty_stats() -> dict[str, Any]:
@@ -212,9 +292,9 @@ def empty_stats() -> dict[str, Any]:
 
 
 def scan_cache_paths(db: Path) -> tuple[Path, Path]:
-  digest = hashlib.sha1(str(db).encode("utf-8")).hexdigest()[:16]
+  digest = hashlib.sha1(str(db.resolve()).encode("utf-8")).hexdigest()[:16]
   root = cache_root()
-  return root / f"opencode-scan-{digest}.json", root / f"opencode-scan-{digest}.lock"
+  return root / f"opencode-go-scan-{digest}.json", root / f"opencode-go-scan-{digest}.lock"
 
 
 def read_fresh_json(path: Path, max_age_seconds: float) -> dict[str, Any] | None:
@@ -246,7 +326,7 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def read_cached_stats(cache_file: Path, max_age_seconds: float) -> dict[str, Any] | None:
   cached = read_fresh_json(cache_file, max_age_seconds)
-  if not isinstance(cached, dict) or cached.get("schemaVersion") != 1:
+  if not isinstance(cached, dict) or cached.get("schemaVersion") != 2:
     return None
   # today* fields only mean "today" on the day they were scanned: a cache
   # from another local date (midnight passed, or the clock moved) is a miss,
@@ -262,7 +342,7 @@ def read_cached_stats(cache_file: Path, max_age_seconds: float) -> dict[str, Any
 
 
 def write_cached_stats(cache_file: Path, stats: dict[str, Any]) -> None:
-  write_json(cache_file, {"schemaVersion": 1, "scanDate": local_date_string(), "stats": stats})
+  write_json(cache_file, {"schemaVersion": 2, "scanDate": local_date_string(), "stats": stats})
 
 
 def cached_scan(db: Path, max_age_seconds: float) -> dict[str, Any]:
@@ -271,7 +351,7 @@ def cached_scan(db: Path, max_age_seconds: float) -> dict[str, Any]:
   try:
     return _cached_scan(db, max_age_seconds)
   except Exception as exc:
-    print(f"omarchy-agent-usage-opencode: cache unavailable ({exc}); scanning directly", file=sys.stderr)
+    print(f"omarchy-agent-usage-opencode-go: cache unavailable ({exc}); scanning directly", file=sys.stderr)
     stats, _ = scan_opencode_db(db)
     return stats
 
@@ -316,16 +396,59 @@ def read_auth_json(path: Path) -> str:
   return str(entry.get("key") or "").strip()
 
 
-def credentials(auth_path: Path) -> str:
+def read_sqlite_credential(db: Path) -> str:
+  try:
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+  except sqlite3.Error:
+    return ""
+  try:
+    rows = conn.execute(
+      "SELECT value FROM credential WHERE integration_id = ? "
+      "ORDER BY active DESC, time_updated DESC",
+      ("opencode-go",),
+    )
+    for (raw,) in rows:
+      try:
+        value = json.loads(raw)
+      except (TypeError, json.JSONDecodeError):
+        continue
+      if isinstance(value, dict) and value.get("type") == "key":
+        key = str(value.get("key") or "").strip()
+        if key:
+          return key
+  except sqlite3.Error:
+    return ""
+  finally:
+    conn.close()
+  return ""
+
+
+def credentials(auth_path: Path, db: Path | None = None) -> str:
   # An explicit key beats whatever opencode happens to be signed in with.
-  return str(os.environ.get("OPENCODE_API_KEY", "")).strip() or read_auth_json(auth_path)
+  explicit = str(os.environ.get("OPENCODE_API_KEY", "")).strip()
+  if explicit:
+    return explicit
+  if db is not None:
+    key = read_sqlite_credential(db)
+    if key:
+      return key
+  return read_auth_json(auth_path)
 
 
 class GoUsageError(Exception):
-  def __init__(self, message: str, auth: bool = False, transport: bool = False):
+  def __init__(
+    self,
+    message: str,
+    auth: bool = False,
+    entitlement: bool = False,
+    transport: bool = False,
+    retry: bool = False,
+  ):
     super().__init__(message)
     self.auth = auth
+    self.entitlement = entitlement
     self.transport = transport
+    self.retry = retry
 
 
 class GoUsageClient:
@@ -348,15 +471,34 @@ class GoUsageClient:
     try:
       with urllib.request.urlopen(request, timeout=10) as response:
         payload = json.loads(response.read().decode("utf-8", errors="replace"))
-        return payload if isinstance(payload, dict) else {}
+        if not isinstance(payload, dict) or not payload:
+          raise GoUsageError(
+            "OpenCode's usage endpoint returned an empty payload", retry=True
+          )
+        return payload
     except urllib.error.HTTPError as error:
-      if error.code in (401, 403):
+      if error.code == 401:
         raise GoUsageError("OpenCode Go rejected the API key", auth=True)
-      raise GoUsageError(f"OpenCode's usage endpoint returned status {error.code}")
-    except urllib.error.URLError as error:
+      body = ""
+      if error.code == 403:
+        try:
+          body = error.read().decode("utf-8", errors="replace")
+        except Exception:
+          pass
+        if "EntitlementError" in body:
+          raise GoUsageError(
+            "OpenCode Go subscription required", entitlement=True
+          )
+      retry = error.code == 429 or error.code >= 500
+      raise GoUsageError(
+        f"OpenCode's usage endpoint returned status {error.code}", retry=retry
+      )
+    except (urllib.error.URLError, OSError, TimeoutError) as error:
       raise GoUsageError("Could not reach OpenCode's usage endpoint", transport=True) from error
-    except (json.JSONDecodeError, TimeoutError) as error:
-      raise GoUsageError("OpenCode returned an invalid usage response") from error
+    except json.JSONDecodeError as error:
+      raise GoUsageError(
+        "OpenCode returned an invalid usage response", retry=True
+      ) from error
 
 
 # The live endpoint nests the windows under "usage" with "percent" and
@@ -377,17 +519,11 @@ def parse_percent(value: Any) -> float:
     return float("nan")
 
 
-def normalize_percent(value: Any, percent_scale: bool) -> float | None:
+def normalize_percent(value: Any) -> float | None:
   n = parse_percent(value)
   if not (n >= 0):
     return None
-  # The endpoint reports percentages (2 means 2%). A payload speaking in
-  # fractions (0.02) is only assumed when nothing in it reaches 1 — the
-  # payload-wide scale detection the Claude collector uses — so a lone 1.0
-  # renders as 1%, not 100%.
-  if percent_scale or n > 1:
-    return min(1.0, n / 100.0)
-  return min(1.0, n)
+  return min(1.0, n / 100.0)
 
 
 def reset_from_seconds(value: Any) -> str:
@@ -408,12 +544,9 @@ def parse_usage_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(entry, dict):
       continue
     windows.append((label, entry))
-  # One payload speaks one convention, so every window settles the scale
-  # together rather than each assuming its own.
-  percent_scale = any(parse_percent(entry.get("percent", entry.get("usagePercent"))) >= 1 for _, entry in windows)
   out: list[dict[str, Any]] = []
   for label, entry in windows:
-    percent = normalize_percent(entry.get("percent", entry.get("usagePercent")), percent_scale)
+    percent = normalize_percent(entry.get("percent", entry.get("usagePercent")))
     if percent is None:
       continue
     # A rate-limited window is at 100% and its reset is what matters.
@@ -443,11 +576,30 @@ def limit_window_open(entry: dict[str, Any], now: dt.datetime) -> bool:
 
 
 def usable_cached_limits(cached: dict[str, Any]) -> list[dict[str, Any]]:
+  if cached_fetched_at(cached) is None:
+    return []
   entries = cached.get("limits")
   if not isinstance(entries, list):
     return []
   now = dt.datetime.now(dt.timezone.utc)
   return [entry for entry in entries if isinstance(entry, dict) and limit_window_open(entry, now)]
+
+
+def cached_fetched_at(cached: dict[str, Any]) -> float | None:
+  try:
+    fetched_at_ms = float(cached.get("fetchedAtMs"))
+  except (TypeError, ValueError):
+    return None
+  if not math.isfinite(fetched_at_ms) or fetched_at_ms <= 0:
+    return None
+  if fetched_at_ms > time.time() * 1000:
+    return None
+  return fetched_at_ms / 1000
+
+
+def limits_cache_path(api_key: str) -> Path:
+  digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+  return cache_root() / f"opencode-go-limits-{digest}.json"
 
 
 def collect_limits(api_key: str, base_url: str, force: bool) -> dict[str, Any]:
@@ -458,30 +610,44 @@ def collect_limits(api_key: str, base_url: str, force: bool) -> dict[str, Any]:
   # kept as the answer of record when a later probe fails, for as long as
   # their windows have not since reset. A forced refresh bypasses the window:
   # that is what the user asked for.
-  probe_cache = cache_root() / "opencode-limits.json"
-  cached = read_fresh_json(probe_cache, float("inf")) or {}
-  fallback = usable_cached_limits(cached)
-
   if api_key == "":
-    # Still-open windows outlive the key that fetched them, so show them
-    # under the auth status rather than an empty section.
-    result["limits"] = fallback
     result["usageStatusText"] = "Waiting for auth"
     return result
 
-  fetched_at = number(cached.get("fetchedAtMs")) / 1000
+  probe_cache = None
+  cached: dict[str, Any] = {}
+  try:
+    probe_cache = limits_cache_path(api_key)
+    if not force:
+      loaded = read_fresh_json(probe_cache, float("inf"))
+      if isinstance(loaded, dict):
+        cached = loaded
+  except Exception:
+    probe_cache = None
+  fallback = [] if force else usable_cached_limits(cached)
+  fetched_at = cached_fetched_at(cached)
   min_interval = 0 if force else PROBE_MIN_INTERVAL_SECONDS
-  if fallback and min_interval > 0 and time.time() - fetched_at < min_interval:
+  if (
+    fallback
+    and fetched_at is not None
+    and min_interval > 0
+    and time.time() - fetched_at < min_interval
+  ):
     result["limits"] = fallback
     return result
 
   try:
-    limits = parse_usage_payload(GoUsageClient(api_key, base_url).probe())
+    payload = GoUsageClient(api_key, base_url).probe()
+    limits = parse_usage_payload(payload)
+    if not limits:
+      raise GoUsageError(
+        "OpenCode's usage endpoint returned no usage windows", retry=True
+      )
   except GoUsageError as error:
     # A transport failure reached no server at all — no route, no DNS. Any
     # real answer, including an error status, is a server we should stop
     # pestering; this is not.
-    if error.transport:
+    if error.transport or error.retry:
       result["retryAdvised"] = True
     if error.auth:
       # A rejected key is an account problem, not a transient outage: keep
@@ -494,6 +660,15 @@ def collect_limits(api_key: str, base_url: str, force: bool) -> dict[str, Any]:
         + " " + AUTH_HELP
       )
       return result
+    if error.entitlement:
+      result["limits"] = fallback
+      result["usageStatusText"] = "OpenCode Go subscription required"
+      result["authHelpText"] = (
+        "This API key does not include OpenCode Go"
+        + (" — showing the last known limits." if fallback else ".")
+        + " " + AUTH_HELP
+      )
+      return result
     if fallback:
       result["limits"] = fallback
     else:
@@ -501,26 +676,30 @@ def collect_limits(api_key: str, base_url: str, force: bool) -> dict[str, Any]:
       result["authHelpText"] = str(error)
     return result
 
-  if not limits:
-    if fallback:
-      result["limits"] = fallback
-    else:
-      result["usageStatusText"] = "OpenCode Go limits unavailable"
-      result["authHelpText"] = "OpenCode's usage endpoint returned no windows."
-    return result
   result["limits"] = limits
-  write_json(probe_cache, {"fetchedAtMs": round(time.time() * 1000), "limits": limits})
+  if probe_cache is not None:
+    try:
+      write_json(probe_cache, {"fetchedAtMs": round(time.time() * 1000), "limits": limits})
+    except Exception:
+      pass
   return result
 
 
 # -------------------------------------------------------------------- record
 
 
-def scan(auth_path: Path, db: Path, base_url: str = API_BASE_URL, force: bool = False, limits_only: bool = False, cache_seconds: float = 20) -> dict[str, Any]:
-  scan_age = 0 if force else (900 if limits_only else cache_seconds)
-  stats = cached_scan(db, scan_age) if db.is_file() else empty_stats()
+def scan(
+  auth_path: Path,
+  db: Path | None = None,
+  base_url: str = API_BASE_URL,
+  force: bool = False,
+  limits_only: bool = False,
+) -> dict[str, Any]:
+  db = opencode_db_path() if db is None else db
+  scan_age = 0 if force else (900 if limits_only else 20)
+  stats = cached_scan(db, scan_age) if db and db.is_file() else empty_stats()
 
-  api_key = credentials(auth_path)
+  api_key = credentials(auth_path, db)
   limits = collect_limits(api_key, base_url, force)
 
   record = {
@@ -547,19 +726,22 @@ def scan(auth_path: Path, db: Path, base_url: str = API_BASE_URL, force: bool = 
 
 def main() -> int:
   parser = argparse.ArgumentParser(description="Print the OpenCode Go usage record as JSON")
-  parser.add_argument("--force", action="store_true", help="rescan the database and re-probe limits, ignoring caches")
-  parser.add_argument("--limits-only", action="store_true", help="reuse any recent database scan; only the limits probe must be fresh")
-  parser.add_argument("--cache-seconds", type=float, default=20)
-  parser.add_argument("--api-base-url", default=os.environ.get("OPENCODE_API_BASE_URL", API_BASE_URL))
+  parser.add_argument(
+    "--force",
+    action="store_true",
+    help="rescan the database and re-probe limits, ignoring caches",
+  )
+  parser.add_argument(
+    "--limits-only",
+    action="store_true",
+    help="reuse any recent database scan; only the limits probe must be fresh",
+  )
   args = parser.parse_args()
 
   record = scan(
     data_home() / "opencode" / "auth.json",
-    opencode_db_path(),
-    base_url=args.api_base_url,
     force=args.force,
     limits_only=args.limits_only,
-    cache_seconds=args.cache_seconds,
   )
   print(json.dumps(record, separators=(",", ":"), sort_keys=True))
   return 0
