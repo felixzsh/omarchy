@@ -43,6 +43,17 @@ scanner = importlib.util.module_from_spec(spec)
 loader.exec_module(scanner)
 real_client = scanner.GoUsageClient
 
+
+def first_token(auth_path, db=None):
+  found = scanner.credential_candidates(auth_path, db)
+  return found[0].token if found else ""
+
+
+def probe_limits(key, force=False):
+  candidates = [scanner.Credential(key, scanner.USAGE_PATH, {})] if key else []
+  return scanner.collect_limits(candidates, "https://example.invalid", force)
+
+
 data_home = test_home / "data"
 os.environ["XDG_DATA_HOME"] = str(data_home)
 auth_path = data_home / "opencode" / "auth.json"
@@ -225,14 +236,14 @@ selected = scanner.opencode_db_path()
 os.environ["OPENCODE_DB"] = str(v1_db)
 override = scanner.opencode_db_path()
 os.environ.pop("OPENCODE_DB")
-v2_key = scanner.credentials(auth_path, selected_db)
+v2_key = first_token(auth_path, selected_db)
 empty_auth = test_home / "empty-auth.json"
 empty_auth.write_text("{}")
 conn = sqlite3.connect(selected_db)
 conn.execute("UPDATE credential SET active = 0")
 conn.commit()
 conn.close()
-inactive_key = scanner.credentials(empty_auth, selected_db)
+inactive_key = first_token(empty_auth, selected_db)
 selected_db.unlink()
 fallback = scanner.opencode_db_path()
 
@@ -261,21 +272,28 @@ zero_limits = scanner.parse_usage_payload(
 )
 
 os.environ["OPENCODE_API_KEY"] = "sk_env"
-env_key = scanner.credentials(auth_path) == "sk_env"
+env_key = first_token(auth_path) == "sk_env"
 os.environ.pop("OPENCODE_API_KEY")
-auth_key = scanner.credentials(auth_path) == "sk_auth"
-missing_key = scanner.credentials(empty_auth) == ""
+auth_key = first_token(auth_path) == "sk_auth"
+missing_key = first_token(empty_auth) == ""
 
 
 class FakeClient:
   mode = "live"
   calls = 0
+  reject = set()
+  last_path = ""
+  last_headers = {}
 
-  def __init__(self, api_key, base_url):
-    pass
+  def __init__(self, token, base_url, path, headers=None):
+    self.token = token
+    FakeClient.last_path = path
+    FakeClient.last_headers = headers or {}
 
   def probe(self):
     FakeClient.calls += 1
+    if self.token in FakeClient.reject:
+      raise scanner.GoUsageError("rejected", auth=True)
     if FakeClient.mode == "live":
       return live_payload
     if FakeClient.mode == "reject":
@@ -319,33 +337,101 @@ closed_window = {
   "resetsAt": (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat(),
 }
 seed_limits("stale", [closed_window, open_window])
-stale = scanner.collect_limits("sk_auth", "https://example.invalid", False)
+stale = probe_limits("sk_auth")
 seed_limits("reuse", [open_window], age=0)
 FakeClient.mode = "offline"
-reused = scanner.collect_limits("sk_auth", "https://example.invalid", False)
+reused = probe_limits("sk_auth")
 FakeClient.mode = "live"
 before_force = FakeClient.calls
-forced = scanner.collect_limits("sk_auth", "https://example.invalid", True)
+forced = probe_limits("sk_auth", True)
 forced_calls = FakeClient.calls - before_force
 seed_limits("expired", [closed_window], age=0)
-expired = scanner.collect_limits("sk_auth", "https://example.invalid", False)
+expired = probe_limits("sk_auth")
 seed_limits("rejected-cache", [closed_window, open_window])
 FakeClient.mode = "reject"
-rejected_cached = scanner.collect_limits("sk_auth", "https://example.invalid", False)
+rejected_cached = probe_limits("sk_auth")
 seed_limits("entitlement", [open_window])
 FakeClient.mode = "entitlement"
-entitlement = scanner.collect_limits("sk_auth", "https://example.invalid", False)
+entitlement = probe_limits("sk_auth")
 seed_limits("other-account", [open_window])
 FakeClient.mode = "offline"
-other_account = scanner.collect_limits("sk_other", "https://example.invalid", False)
-no_key = scanner.collect_limits("", "https://example.invalid", False)
+other_account = probe_limits("sk_other")
+no_key = probe_limits("")
 
 os.environ["XDG_CACHE_HOME"] = str(test_home / "cache" / "corrupt-limit")
 cache_file = scanner.limits_cache_path("sk_auth")
 cache_file.parent.mkdir(parents=True, exist_ok=True)
 cache_file.write_text("[]")
 FakeClient.mode = "live"
-corrupt_limits = scanner.collect_limits("sk_auth", "https://example.invalid", False)
+corrupt_limits = probe_limits("sk_auth")
+
+
+# opencode v2 signs in to OpenCode Console, and the opencode-go provider
+# resolves its credentials through that same integration: a different endpoint,
+# workspace scoped, and last in line behind every explicit key.
+def console_db(name, expires_delta, org="wrk_1"):
+  path = data_home / "opencode" / name
+  conn = sqlite3.connect(path)
+  create_v2_table(conn)
+  conn.execute(
+    "CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, "
+    "label TEXT NOT NULL, value TEXT NOT NULL, active INTEGER, "
+    "time_updated INTEGER NOT NULL)"
+  )
+  metadata = {"email": "a@example.com"}
+  if org:
+    metadata["orgID"] = org
+  conn.execute(
+    "INSERT INTO credential VALUES (?, ?, ?, ?, ?, ?)",
+    (
+      "console", "opencode", "Default",
+      json.dumps({
+        "type": "oauth", "methodID": "device", "access": "sess_console",
+        "refresh": "r", "expires": now_ms + expires_delta, "metadata": metadata,
+      }),
+      1, now_ms,
+    ),
+  )
+  conn.commit()
+  conn.close()
+  return path
+
+
+live_console_db = console_db("console-live.db", 86400000)
+stale_console_db = console_db("console-stale.db", -1000)
+no_org_db = console_db("console-no-org.db", 86400000, org="")
+console_candidates = scanner.credential_candidates(auth_path, live_console_db)
+console = console_candidates[-1]
+console_parse = {
+  "count": len(console_candidates),
+  "token": console.token,
+  "path": console.path,
+  "org": console.headers.get(scanner.CONSOLE_ORG_HEADER),
+  "expired": console.expired,
+}
+
+# A dead key in front must not hide the live Console session behind it.
+FakeClient.mode = "live"
+FakeClient.reject = {"sk_auth"}
+os.environ["XDG_CACHE_HOME"] = str(test_home / "cache" / "console")
+fallthrough = scanner.collect_limits(
+  console_candidates, "https://example.invalid", False
+)
+console_path = FakeClient.last_path
+console_headers = dict(FakeClient.last_headers)
+FakeClient.reject = set()
+
+# An expired session is a refresh problem, not a rejected sign-in.
+FakeClient.mode = "reject"
+os.environ["XDG_CACHE_HOME"] = str(test_home / "cache" / "console-expired")
+expired_session = scanner.collect_limits(
+  scanner.credential_candidates(empty_auth, stale_console_db),
+  "https://example.invalid", False,
+)
+FakeClient.mode = "live"
+stale_console = scanner.credential_candidates(empty_auth, stale_console_db)[0]
+# A wrong workspace is a hard 403, so the header is dropped rather than guessed.
+no_org = scanner.credential_candidates(empty_auth, no_org_db)[0]
 
 
 captured = {}
@@ -508,6 +594,15 @@ print(json.dumps({
     "ua": captured["headers"]["user-agent"],
     "errors": errors,
   },
+  "console": {
+    "parse": console_parse,
+    "path": console_path,
+    "orgHeader": console_headers.get(scanner.CONSOLE_ORG_HEADER),
+    "fallsThrough": [len(fallthrough["limits"]), fallthrough["usageStatusText"]],
+    "stale": stale_console.expired,
+    "expiredStatus": expired_session["usageStatusText"],
+    "droppedOrg": no_org.headers,
+  },
   "statsCache": {
     "date": envelope["scanDate"] == scanner.local_date_string(),
     "schema": envelope["schemaVersion"],
@@ -593,6 +688,19 @@ pass "OpenCode collector separates entitlement, account, and corrupt-cache failu
   [[ $(jq -r '.probe.errors.offline' <<<"$result") == *"Could not reach"* ]]; } ||
   fail "OpenCode probe maps endpoint authentication and transport failures" "$result"
 pass "OpenCode probe maps endpoint authentication and transport failures"
+
+{ [[ $(jq -c '.console.parse' <<<"$result") == \
+    '{"count":2,"token":"sess_console","path":"/inference/go/v1/usage",'\
+'"org":"wrk_1","expired":false}' ]] &&
+  [[ $(jq -r '.console.path' <<<"$result") == "/inference/go/v1/usage" ]] &&
+  [[ $(jq -r '.console.orgHeader' <<<"$result") == "wrk_1" ]] &&
+  [[ $(jq -c '.console.fallsThrough' <<<"$result") == '[3,""]' ]] &&
+  [[ $(jq -r '.console.stale' <<<"$result") == "true" ]] &&
+  [[ $(jq -r '.console.expiredStatus' <<<"$result") == \
+    "OpenCode Console session expired" ]] &&
+  [[ $(jq -c '.console.droppedOrg' <<<"$result") == '{}' ]]; } ||
+  fail "OpenCode collector falls through to the Console session on its own endpoint" "$result"
+pass "OpenCode collector falls through to the Console session on its own endpoint"
 
 { [[ $(jq -r '[.statsCache.date, .statsCache.schema, .statsCache.tokens] | join(":")' \
     <<<"$result") == "true:2:1867" ]] &&

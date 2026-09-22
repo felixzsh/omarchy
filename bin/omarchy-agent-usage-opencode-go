@@ -28,13 +28,18 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 AGENT_ID = "opencode-go"
 AGENT_NAME = "OpenCode"
 AUTH_HELP = "Run `opencode auth login` and subscribe to OpenCode Go, or set OPENCODE_API_KEY."
 API_BASE_URL = "https://opencode.ai"
 USAGE_PATH = "/zen/go/v1/usage"
+CONSOLE_USAGE_PATH = "/inference/go/v1/usage"
+CONSOLE_ORG_HEADER = "x-opencode-org-id"
+CONSOLE_EXPIRED_HELP = (
+  "OpenCode's Console session has expired — run `opencode auth login` to refresh it."
+)
 PROBE_MIN_INTERVAL_SECONDS = 15
 
 
@@ -389,6 +394,15 @@ def _cached_scan(db: Path, max_age_seconds: float) -> dict[str, Any]:
 # run on other machines or in other harnesses.
 
 
+class Credential(NamedTuple):
+  """One way of answering who is asking for OpenCode Go usage."""
+
+  token: str
+  path: str
+  headers: dict[str, str]
+  expired: bool = False
+
+
 def read_auth_json(path: Path) -> str:
   try:
     parsed = json.loads(path.read_text())
@@ -427,16 +441,62 @@ def read_sqlite_credential(db: Path) -> str:
   return ""
 
 
-def credentials(auth_path: Path, db: Path | None = None) -> str:
-  # An explicit key beats whatever opencode happens to be signed in with.
-  explicit = str(os.environ.get("OPENCODE_API_KEY", "")).strip()
-  if explicit:
-    return explicit
+def read_console_credential(db: Path) -> Credential | None:
+  """Read the OpenCode Console session opencode v2 stores in SQLite.
+
+  The opencode-go provider resolves its own credentials through the `opencode`
+  integration, so a Console session answers as an OpenCode Go credential — on
+  Console's own endpoint, carrying the workspace id Console traffic is scoped
+  to. A wrong workspace is a hard 403, so the header only goes out when the
+  id is actually there.
+  """
+  try:
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+  except sqlite3.Error:
+    return None
+  try:
+    rows = conn.execute(
+      "SELECT value FROM credential WHERE integration_id = ? AND active = 1 "
+      "ORDER BY active DESC, time_updated DESC",
+      ("opencode",),
+    )
+    for (raw,) in rows:
+      try:
+        value = json.loads(raw)
+      except (TypeError, json.JSONDecodeError):
+        continue
+      if not isinstance(value, dict) or value.get("type") != "oauth":
+        continue
+      token = str(value.get("access") or "").strip()
+      if not token:
+        continue
+      metadata = value.get("metadata")
+      org = str(metadata.get("orgID") or "").strip() if isinstance(metadata, dict) else ""
+      headers = {CONSOLE_ORG_HEADER: org} if org else {}
+      expired = 0 < number(value.get("expires")) <= time.time() * 1000
+      return Credential(token, CONSOLE_USAGE_PATH, headers, expired)
+  except sqlite3.Error:
+    return None
+  finally:
+    conn.close()
+  return None
+
+
+def credential_candidates(auth_path: Path, db: Path | None = None) -> list[Credential]:
+  # An explicit key beats whatever opencode happens to be signed in with, and
+  # the Console session is the implicit one, so it comes last. Candidates are
+  # only skipped when they are absent: which one the endpoint accepts is not
+  # knowable from here, and a stale key in front must not hide a live one.
+  tokens = [str(os.environ.get("OPENCODE_API_KEY", "")).strip()]
   if db is not None:
-    key = read_sqlite_credential(db)
-    if key:
-      return key
-  return read_auth_json(auth_path)
+    tokens.append(read_sqlite_credential(db))
+  tokens.append(read_auth_json(auth_path))
+  candidates = [Credential(token, USAGE_PATH, {}) for token in tokens if token]
+  if db is not None:
+    console = read_console_credential(db)
+    if console is not None:
+      candidates.append(console)
+  return candidates
 
 
 class GoUsageError(Exception):
@@ -456,20 +516,29 @@ class GoUsageError(Exception):
 
 
 class GoUsageClient:
-  def __init__(self, api_key: str, base_url: str = API_BASE_URL):
-    self.api_key = api_key
+  def __init__(
+    self,
+    token: str,
+    base_url: str = API_BASE_URL,
+    path: str = USAGE_PATH,
+    headers: dict[str, str] | None = None,
+  ):
+    self.token = token
     self.base_url = base_url.rstrip("/")
+    self.path = path
+    self.headers = headers or {}
 
   def probe(self) -> dict[str, Any]:
     # Cloudflare in front of opencode.ai blocks the default Python-urllib
     # signature (Error 1010); any recognizable agent passes, so identify the
     # probe rather than borrow a browser's.
     request = urllib.request.Request(
-      self.base_url + USAGE_PATH,
+      self.base_url + self.path,
       headers={
-        "Authorization": "Bearer " + self.api_key,
+        "Authorization": "Bearer " + self.token,
         "Accept": "application/json",
         "User-Agent": "omarchy-agent-usage/1",
+        **self.headers,
       },
     )
     try:
@@ -607,86 +676,105 @@ def limits_cache_path(api_key: str) -> Path:
   return cache_root() / f"opencode-go-limits-{digest}.json"
 
 
-def collect_limits(api_key: str, base_url: str, force: bool) -> dict[str, Any]:
-  result = {"limits": [], "usageStatusText": "", "authHelpText": AUTH_HELP}
+def collect_limits(
+  candidates: list[Credential], base_url: str, force: bool
+) -> dict[str, Any]:
+  result: dict[str, Any] = {
+    "limits": [],
+    "usageStatusText": "",
+    "authHelpText": AUTH_HELP,
+  }
 
   # A panel that is opened and shut repeatedly must not turn into a request
   # per flick, so recent probe results are reused for a short window — and
   # kept as the answer of record when a later probe fails, for as long as
   # their windows have not since reset. A forced refresh bypasses the window:
   # that is what the user asked for.
-  if api_key == "":
+  if not candidates:
     result["usageStatusText"] = "Waiting for auth"
     return result
 
-  probe_cache = None
-  cached: dict[str, Any] = {}
-  try:
-    probe_cache = limits_cache_path(api_key)
-    if not force:
-      loaded = read_fresh_json(probe_cache, float("inf"))
-      if isinstance(loaded, dict):
-        cached = loaded
-  except Exception:
-    probe_cache = None
-  fallback = [] if force else usable_cached_limits(cached)
-  fetched_at = cached_fetched_at(cached)
   min_interval = 0 if force else PROBE_MIN_INTERVAL_SECONDS
-  if (
-    fallback
-    and fetched_at is not None
-    and min_interval > 0
-    and time.time() - fetched_at < min_interval
-  ):
-    result["limits"] = fallback
-    return result
+  refused: tuple[GoUsageError, list[dict[str, Any]], bool] | None = None
 
-  try:
-    payload = GoUsageClient(api_key, base_url).probe()
-    limits = parse_usage_payload(payload)
-    if not limits:
-      raise GoUsageError(
-        "OpenCode's usage endpoint returned no usage windows", retry=True
-      )
-  except GoUsageError as error:
-    # A transport failure reached no server at all — no route, no DNS. Any
-    # real answer, including an error status, is a server we should stop
-    # pestering; this is not.
-    if error.transport or error.retry:
-      result["retryAdvised"] = True
-    if error.auth:
-      # A rejected key is an account problem, not a transient outage: keep
-      # any still-open numbers, but say the sign-in is bad.
-      result["limits"] = fallback
-      result["usageStatusText"] = "Sign-in rejected"
-      result["authHelpText"] = (
-        "OpenCode Go rejected the API key"
-        + (" — showing the last known limits." if fallback else ".")
-        + " " + AUTH_HELP
-      )
-      return result
-    if error.entitlement:
-      result["limits"] = fallback
-      result["usageStatusText"] = "OpenCode Go subscription required"
-      result["authHelpText"] = (
-        "This API key does not include OpenCode Go"
-        + (" — showing the last known limits." if fallback else ".")
-        + " " + AUTH_HELP
-      )
-      return result
-    if fallback:
-      result["limits"] = fallback
-    else:
-      result["usageStatusText"] = "OpenCode Go limits unavailable"
-      result["authHelpText"] = str(error)
-    return result
-
-  result["limits"] = limits
-  if probe_cache is not None:
+  for candidate in candidates:
+    probe_cache = None
+    cached: dict[str, Any] = {}
     try:
-      write_json(probe_cache, {"fetchedAtMs": round(time.time() * 1000), "limits": limits})
+      probe_cache = limits_cache_path(candidate.token)
+      if not force:
+        loaded = read_fresh_json(probe_cache, float("inf"))
+        if isinstance(loaded, dict):
+          cached = loaded
     except Exception:
-      pass
+      probe_cache = None
+    fallback = [] if force else usable_cached_limits(cached)
+    fetched_at = cached_fetched_at(cached)
+    if (
+      fallback
+      and fetched_at is not None
+      and min_interval > 0
+      and time.time() - fetched_at < min_interval
+    ):
+      result["limits"] = fallback
+      return result
+
+    try:
+      payload = GoUsageClient(
+        candidate.token, base_url, candidate.path, candidate.headers
+      ).probe()
+      limits = parse_usage_payload(payload)
+      if not limits:
+        raise GoUsageError(
+          "OpenCode's usage endpoint returned no usage windows", retry=True
+        )
+    except GoUsageError as error:
+      # A credential the endpoint refuses may just be the wrong one for this
+      # account, so the next way in still gets its turn. Anything else is not
+      # about which credential we picked: a transport failure reached no
+      # server at all, and any real answer — including an error status — is a
+      # server we should stop pestering.
+      if error.auth or error.entitlement:
+        refused = (error, fallback, candidate.expired)
+        continue
+      if error.transport or error.retry:
+        result["retryAdvised"] = True
+      if fallback:
+        result["limits"] = fallback
+      else:
+        result["usageStatusText"] = "OpenCode Go limits unavailable"
+        result["authHelpText"] = str(error)
+      return result
+
+    result["limits"] = limits
+    if probe_cache is not None:
+      try:
+        write_json(probe_cache, {"fetchedAtMs": round(time.time() * 1000), "limits": limits})
+      except Exception:
+        pass
+    return result
+
+  # Every way in was refused. A rejected credential is an account problem, not
+  # a transient outage: keep any still-open numbers, but say what went wrong.
+  error, fallback, expired = refused
+  result["limits"] = fallback
+  if error.entitlement:
+    result["usageStatusText"] = "OpenCode Go subscription required"
+    result["authHelpText"] = (
+      "This API key does not include OpenCode Go"
+      + (" — showing the last known limits." if fallback else ".")
+      + " " + AUTH_HELP
+    )
+  elif expired:
+    result["usageStatusText"] = "OpenCode Console session expired"
+    result["authHelpText"] = CONSOLE_EXPIRED_HELP
+  else:
+    result["usageStatusText"] = "Sign-in rejected"
+    result["authHelpText"] = (
+      "OpenCode rejected the stored sign-in"
+      + (" — showing the last known limits." if fallback else ".")
+      + " " + AUTH_HELP
+    )
   return result
 
 
@@ -704,8 +792,7 @@ def scan(
   scan_age = 0 if force else (900 if limits_only else 20)
   stats = cached_scan(db, scan_age) if db and db.is_file() else empty_stats()
 
-  api_key = credentials(auth_path, db)
-  limits = collect_limits(api_key, base_url, force)
+  limits = collect_limits(credential_candidates(auth_path, db), base_url, force)
 
   record = {
     "schemaVersion": 1,
