@@ -33,5 +33,5 @@ refresh_running_browser brave brave
 # bare -f brave-origin pattern would also match the installer's own terminal.
 refresh_running_browser /opt/brave-origin-bin/ brave-origin -f
 
-"$OMARCHY_PATH/default/vivaldi/vivaldi-theme-refresh"
+"$OMARCHY_PATH/default/vivaldi/vivaldi-theme-refresh" || failed=1
 exit "$failed"
