@@ -690,8 +690,8 @@ def collect_limits(
   # A panel that is opened and shut repeatedly must not turn into a request
   # per flick, so recent probe results are reused for a short window — and
   # kept as the answer of record when a later probe fails, for as long as
-  # their windows have not since reset. A forced refresh bypasses the window:
-  # that is what the user asked for.
+  # their windows have not since reset. A forced refresh bypasses the reuse
+  # window, but a failed probe still falls back to the open cached windows.
   if not candidates:
     result["usageStatusText"] = "Waiting for auth"
     return result
@@ -704,13 +704,12 @@ def collect_limits(
     cached: dict[str, Any] = {}
     try:
       probe_cache = limits_cache_path(candidate.token)
-      if not force:
-        loaded = read_fresh_json(probe_cache, float("inf"))
-        if isinstance(loaded, dict):
-          cached = loaded
+      loaded = read_fresh_json(probe_cache, float("inf"))
+      if isinstance(loaded, dict):
+        cached = loaded
     except Exception:
       probe_cache = None
-    fallback = [] if force else usable_cached_limits(cached)
+    fallback = usable_cached_limits(cached)
     fetched_at = cached_fetched_at(cached)
     if (
       fallback
@@ -737,7 +736,10 @@ def collect_limits(
       # server at all, and any real answer — including an error status — is a
       # server we should stop pestering.
       if error.auth or error.entitlement:
-        refused = (error, fallback, candidate.expired)
+        # Keep the first refusal that still has open windows, so a later
+        # credential without a cache cannot blank them.
+        if refused is None or (not refused[1] and fallback):
+          refused = (error, fallback, candidate.expired)
         continue
       if error.transport:
         result["retryAdvised"] = True

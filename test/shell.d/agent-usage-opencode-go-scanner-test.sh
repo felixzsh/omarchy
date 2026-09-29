@@ -54,6 +54,11 @@ def probe_limits(key, force=False):
   return scanner.collect_limits(candidates, "https://example.invalid", force)
 
 
+def probe_candidates(keys, force=False):
+  candidates = [scanner.Credential(key, scanner.USAGE_PATH, {}) for key in keys]
+  return scanner.collect_limits(candidates, "https://example.invalid", force)
+
+
 data_home = test_home / "data"
 os.environ["XDG_DATA_HOME"] = str(data_home)
 auth_path = data_home / "opencode" / "auth.json"
@@ -348,16 +353,24 @@ seed_limits("stale", [closed_window, open_window])
 stale = probe_limits("sk_auth")
 seed_limits("reuse", [open_window], age=0)
 FakeClient.mode = "offline"
+before_reuse = FakeClient.calls
 reused = probe_limits("sk_auth")
+reuse_calls = FakeClient.calls - before_reuse
 FakeClient.mode = "live"
 before_force = FakeClient.calls
 forced = probe_limits("sk_auth", True)
 forced_calls = FakeClient.calls - before_force
+seed_limits("forced-fallback", [open_window], age=0)
+FakeClient.mode = "offline"
+forced_fallback = probe_limits("sk_auth", True)
+FakeClient.mode = "live"
 seed_limits("expired", [closed_window], age=0)
 expired = probe_limits("sk_auth")
 seed_limits("rejected-cache", [closed_window, open_window])
 FakeClient.mode = "reject"
 rejected_cached = probe_limits("sk_auth")
+seed_limits("refused-first", [open_window], key="sk_first")
+refused_first = probe_candidates(["sk_first", "sk_second"])
 seed_limits("entitlement", [open_window])
 FakeClient.mode = "entitlement"
 entitlement = probe_limits("sk_auth")
@@ -591,10 +604,13 @@ print(json.dumps({
   "cacheLimits": {
     "stale": [w["label"] for w in stale["limits"]],
     "reused": [w["label"] for w in reused["limits"]],
+    "reuseCalls": reuse_calls,
     "forcedCalls": forced_calls,
+    "forcedFallback": [w["label"] for w in forced_fallback["limits"]],
     "expired": [w["label"] for w in expired["limits"]],
     "rejected": [w["label"] for w in rejected_cached["limits"]],
     "rejectedStatus": rejected_cached["usageStatusText"],
+    "refusedFirst": [w["label"] for w in refused_first["limits"]],
     "entitlement": entitlement["usageStatusText"],
     "other": [other_account["limits"], other_account["usageStatusText"]],
     "serverError": [w["label"] for w in server_error["limits"]],
@@ -676,7 +692,10 @@ pass "OpenCode collector preserves local stats through auth and transport failur
 
 { [[ $(jq -c '.cacheLimits.stale' <<<"$result") == '["Weekly (7-day)"]' ]] &&
   [[ $(jq -c '.cacheLimits.reused' <<<"$result") == '["Weekly (7-day)"]' ]] &&
+  [[ $(jq -r '.cacheLimits.reuseCalls' <<<"$result") == "0" ]] &&
   [[ $(jq -r '.cacheLimits.forcedCalls' <<<"$result") == "1" ]] &&
+  [[ $(jq -c '.cacheLimits.forcedFallback' <<<"$result") == '["Weekly (7-day)"]' ]] &&
+  [[ $(jq -c '.cacheLimits.refusedFirst' <<<"$result") == '["Weekly (7-day)"]' ]] &&
   [[ $(jq -c '.cacheLimits.expired' <<<"$result") == \
     '["Session (5-hour)","Weekly (7-day)","Monthly (30-day)"]' ]] &&
   [[ $(jq -r '.cacheLimits.rejectedStatus' <<<"$result") == "Sign-in rejected" ]]; } ||

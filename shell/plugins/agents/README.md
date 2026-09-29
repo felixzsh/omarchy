@@ -96,7 +96,8 @@ cached windows, while transport failures ask the panel to retry; a rejected
 sign-in, an expired Console session, and a missing Go
 subscription each get their own message, because each has a different fix.
 Cache entries are dropped when corrupt, future-dated, or past their windows.
-`--force` bypasses both caches.
+`--force` bypasses the stats cache and the 15-second reuse window, but a failed
+probe still shows open cached windows.
 
 ### Fireworks balance
 
