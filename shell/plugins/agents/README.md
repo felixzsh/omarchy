@@ -83,8 +83,9 @@ The collector accepts both the deployed `usage.<window>.percent/resetsAt`
 shape and the historical `<window>Usage.usagePercent/resetInSec` shape.
 Local token stats select `OPENCODE_DB`, then `opencode.db`, and
 `opencode-v2.db` only when `opencode.db` is absent. Within the selected
-database they read both SQLite generations (`message` and `session_message`)
-and deduplicate migrated rows by message ID.
+database they read both SQLite generations (`message` and `session_message`),
+count V2 compaction usage, drop the history a fork copied from its source
+session, and deduplicate migrated rows by message ID.
 
 The limits endpoint is rate-limited, so successful probes are reused for 15
 seconds. The limits cache is keyed by a hash of the selected credential; the

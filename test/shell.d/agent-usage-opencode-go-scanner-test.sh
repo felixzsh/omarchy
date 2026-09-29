@@ -122,6 +122,10 @@ def create_v2_table(conn):
     "type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, "
     "time_updated INTEGER NOT NULL, data TEXT NOT NULL)"
   )
+  conn.execute(
+    "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, fork_session_id TEXT, "
+    "time_created INTEGER NOT NULL)"
+  )
 
 
 db = data_home / "opencode" / "opencode.db"
@@ -179,6 +183,42 @@ conn.executemany(
   "(id, session_id, type, seq, time_created, time_updated, data) "
   "VALUES (?, ?, ?, ?, ?, ?, ?)",
   v2_rows,
+)
+
+
+# A fork copies its source session's messages under new IDs; OpenCode counts
+# only messages created at or after the fork. A compaction row carries usage of
+# its own. Both would otherwise be missed or double-counted.
+def v2_row_at(message_id, session_id, message_type, created, **tokens):
+  data = {
+    "time": {"created": created},
+    "model": {"id": "deepseek-v4-pro", "providerID": "opencode-go"},
+    "tokens": {
+      "input": tokens.get("input", 0),
+      "output": tokens.get("output", 0),
+      "reasoning": tokens.get("reasoning", 0),
+      "cache": {"read": 0, "write": 0},
+    },
+  }
+  return (
+    message_id, session_id, message_type, 1, created, created, json.dumps(data)
+  )
+
+
+fork_cutoff = now_ms - 1000
+conn.execute(
+  "INSERT INTO session_v2 (id, fork_session_id, time_created) VALUES (?, ?, ?)",
+  ("s-fork", "s-src", fork_cutoff),
+)
+conn.executemany(
+  "INSERT INTO session_message "
+  "(id, session_id, type, seq, time_created, time_updated, data) "
+  "VALUES (?, ?, ?, ?, ?, ?, ?)",
+  [
+    v2_row_at("fork-copied", "s-fork", "assistant", now_ms - 5000, input=5000),
+    v2_row_at("fork-fresh", "s-fork", "assistant", now_ms, input=30, output=10),
+    v2_row_at("comp-1", "s-comp", "compaction", now_ms, input=100, output=20),
+  ],
 )
 conn.commit()
 conn.close()
@@ -649,7 +689,7 @@ PY
 )
 
 [[ $(jq -r '[.stats.todayTotalTokens, .stats.totalPrompts, .complete] | join(":")' \
-  <<<"$result") == "1867:4:true" ]] ||
+  <<<"$result") == "2027:6:true" ]] ||
   fail "OpenCode collector scans V1 and V2 without double-counting" "$result"
 pass "OpenCode collector scans V1 and V2 without double-counting"
 
@@ -685,8 +725,8 @@ pass "OpenCode collector applies API key precedence"
 
 { [[ $(jq -c '.record | {schemaVersion,id,name,ready}' <<<"$result") == \
     '{"schemaVersion":1,"id":"opencode-go","name":"OpenCode","ready":true}' ]] &&
-  [[ $(jq -c '.rejected' <<<"$result") == '["Sign-in rejected",4]' ]] &&
-  [[ $(jq -c '.offline' <<<"$result") == '[true,4]' ]]; } ||
+  [[ $(jq -c '.rejected' <<<"$result") == '["Sign-in rejected",6]' ]] &&
+  [[ $(jq -c '.offline' <<<"$result") == '[true,6]' ]]; } ||
   fail "OpenCode collector preserves local stats through auth and transport failures" "$result"
 pass "OpenCode collector preserves local stats through auth and transport failures"
 
@@ -741,11 +781,11 @@ pass "OpenCode probe maps endpoint authentication and transport failures"
 pass "OpenCode collector falls through to the Console session on its own endpoint"
 
 { [[ $(jq -r '[.statsCache.date, .statsCache.schema, .statsCache.tokens] | join(":")' \
-    <<<"$result") == "true:2:1867" ]] &&
-  [[ $(jq -c '.statsCache.recovered' <<<"$result") == "1867" ]] &&
-  [[ $(jq -c '[.statsCache.limitsOnly, .statsCache.forced]' <<<"$result") == "[4,5]" ]] &&
+    <<<"$result") == "true:2:2027" ]] &&
+  [[ $(jq -c '.statsCache.recovered' <<<"$result") == "2027" ]] &&
+  [[ $(jq -c '[.statsCache.limitsOnly, .statsCache.forced]' <<<"$result") == "[6,7]" ]] &&
   [[ $(jq -c '.statsCache.broken' <<<"$result") == '[0,false,false]' ]] &&
   [[ $(jq -r '.statsCache.rescanned' <<<"$result") == "9" ]] &&
-  [[ $(jq -r '.statsCache.unwritable' <<<"$result") == "5" ]]; } ||
+  [[ $(jq -r '.statsCache.unwritable' <<<"$result") == "7" ]]; } ||
   fail "OpenCode collector validates and safely bypasses local stats caches" "$result"
 pass "OpenCode collector validates and safely bypasses local stats caches"

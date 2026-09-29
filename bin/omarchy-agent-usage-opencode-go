@@ -211,12 +211,24 @@ def scan_opencode_db(db: Path) -> tuple[dict[str, Any], bool]:
           "json_extract(data, '$.providerID') END = 'opencode-go'"
         )
       else:
+        # V2 records usage in assistant and compaction rows. Always alias the
+        # table so the optional fork join can qualify its columns.
+        source = "session_message m"
+        fork_filter = ""
+        if "session_v2" in tables:
+          # A fork copies the source session's messages under new IDs; OpenCode
+          # counts only messages created at or after the fork session.
+          source += " LEFT JOIN session_v2 s ON s.id = m.session_id"
+          fork_filter = (
+            " AND (s.fork_session_id IS NULL OR m.time_created >= s.time_created)"
+          )
         query = (
-          "SELECT id, session_id, data FROM session_message"
-          " WHERE type = 'assistant'"
-          " AND data LIKE '%\"providerID\"%:%\"opencode-go\"%'"
-          " AND CASE WHEN json_valid(data) THEN "
-          "json_extract(data, '$.model.providerID') END = 'opencode-go'"
+          "SELECT m.id, m.session_id, m.data FROM " + source +
+          " WHERE m.type IN ('assistant', 'compaction')"
+          " AND m.data LIKE '%\"providerID\"%:%\"opencode-go\"%'"
+          " AND CASE WHEN json_valid(m.data) THEN "
+          "json_extract(m.data, '$.model.providerID') END = 'opencode-go'"
+          + fork_filter
         )
 
       for message_id, session_id, raw in conn.execute(query):
