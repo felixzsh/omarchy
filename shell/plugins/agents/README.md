@@ -81,10 +81,10 @@ other harnesses. Percentages from 0 to 100 are normalized to the panel's
 0 to 1 scale, including 0%.
 The collector accepts both the deployed `usage.<window>.percent/resetsAt`
 shape and the historical `<window>Usage.usagePercent/resetInSec` shape.
-Local token stats select `OPENCODE_DB`, then `opencode-v2.db` when present, and
-finally `opencode.db`. Within the selected database they read both SQLite
-generations (`message` and `session_message`) and deduplicate migrated rows by
-message ID. Future releases that use only `opencode.db` need no migration.
+Local token stats select `OPENCODE_DB`, then `opencode.db`, and
+`opencode-v2.db` only when `opencode.db` is absent. Within the selected
+database they read both SQLite generations (`message` and `session_message`)
+and deduplicate migrated rows by message ID.
 
 The limits endpoint is rate-limited, so successful probes are reused for 15
 seconds. The limits cache is keyed by a hash of the selected credential; the
@@ -92,8 +92,8 @@ local stats cache follows the selected database path. Neither is reused
 without a credential or for another account. A credential the endpoint
 refuses gets one more way in tried before the panel is told anything, so a
 stale key cannot hide a live Console session. A failed probe keeps open
-cached windows, while transport and transient server failures ask the panel
-to retry; a rejected sign-in, an expired Console session, and a missing Go
+cached windows, while transport failures ask the panel to retry; a rejected
+sign-in, an expired Console session, and a missing Go
 subscription each get their own message, because each has a different fix.
 Cache entries are dropped when corrupt, future-dated, or past their windows.
 `--force` bypasses both caches.

@@ -9,7 +9,7 @@ TEST_HOME=$(mktemp -d)
 trap 'rm -rf "$TEST_HOME"' EXIT
 
 no_key=$(HOME="$TEST_HOME" XDG_DATA_HOME="$TEST_HOME/.local/share" \
-  XDG_CACHE_HOME="$TEST_HOME/.cache" OPENCODE_API_KEY="" \
+  XDG_CACHE_HOME="$TEST_HOME/.cache" OPENCODE_API_KEY="" OPENCODE_DB="" \
   "$ROOT/bin/omarchy-agent-usage-opencode-go")
 
 [[ $(jq -r '[.id, .ready, .name, .tierLabel] | join(":")' <<<"$no_key") == \
@@ -233,6 +233,10 @@ conn.close()
 tui_db = data_home / "opencode" / "opencode-tui-v2.db"
 sqlite3.connect(tui_db).close()
 selected = scanner.opencode_db_path()
+held_db = db.with_name("opencode.db.held")
+db.rename(held_db)
+legacy = scanner.opencode_db_path()
+held_db.rename(db)
 os.environ["OPENCODE_DB"] = str(v1_db)
 override = scanner.opencode_db_path()
 os.environ.pop("OPENCODE_DB")
@@ -302,6 +306,10 @@ class FakeClient:
       raise scanner.GoUsageError("subscription required", entitlement=True)
     if FakeClient.mode == "offline":
       raise scanner.GoUsageError("offline", transport=True)
+    if FakeClient.mode == "server-error":
+      raise scanner.GoUsageError(
+        "OpenCode's usage endpoint returned status 500", retry=True
+      )
     return {}
 
 
@@ -356,6 +364,9 @@ entitlement = probe_limits("sk_auth")
 seed_limits("other-account", [open_window])
 FakeClient.mode = "offline"
 other_account = probe_limits("sk_other")
+seed_limits("server-error", [open_window])
+FakeClient.mode = "server-error"
+server_error = probe_limits("sk_auth")
 no_key = probe_limits("")
 
 os.environ["XDG_CACHE_HOME"] = str(test_home / "cache" / "corrupt-limit")
@@ -552,7 +563,8 @@ print(json.dumps({
   "v1": [v1_stats["totalPrompts"], v1_stats["todayTotalTokens"], v1_complete],
   "v2": [v2_stats["totalPrompts"], v2_stats["todayTotalTokens"], v2_complete],
   "selection": {
-    "v2": selected.resolve() == selected_db.resolve(),
+    "normal": selected.resolve() == db.resolve(),
+    "legacy": legacy.resolve() == selected_db.resolve(),
     "override": override == v1_db.resolve(),
     "fallback": fallback.resolve() == db.resolve(),
     "ignoresTui": selected != tui_db,
@@ -585,6 +597,8 @@ print(json.dumps({
     "rejectedStatus": rejected_cached["usageStatusText"],
     "entitlement": entitlement["usageStatusText"],
     "other": [other_account["limits"], other_account["usageStatusText"]],
+    "serverError": [w["label"] for w in server_error["limits"]],
+    "serverErrorRetry": server_error.get("retryAdvised"),
     "noKey": [no_key["limits"], no_key["usageStatusText"]],
     "corrupt": len(corrupt_limits["limits"]),
   },
@@ -636,10 +650,10 @@ pass "OpenCode collector prefers V2 data for duplicate message IDs"
 pass "OpenCode collector supports both SQLite generations and date totals"
 
 [[ $(jq -c '.selection' <<<"$result") == \
-  '{"v2":true,"override":true,"fallback":true,"ignoresTui":true,'\
-'"v2Key":true,"inactiveIgnored":true}' ]] ||
-  fail "OpenCode collector selects V2, honors overrides, and ignores inactive credentials" "$result"
-pass "OpenCode collector selects V2, honors overrides, and ignores inactive credentials"
+  '{"normal":true,"legacy":true,"override":true,"fallback":true,'\
+'"ignoresTui":true,"v2Key":true,"inactiveIgnored":true}' ]] ||
+  fail "OpenCode collector prefers opencode.db, honors overrides, and ignores inactive credentials" "$result"
+pass "OpenCode collector prefers opencode.db, honors overrides, and ignores inactive credentials"
 
 { jq -e '.limits.live | map(.percent) == [0.02, 0.03, 0.38]' <<<"$result" >/dev/null &&
   jq -e '.limits.old | map(.percent) == [0.19, 0.05]' <<<"$result" >/dev/null &&
@@ -677,6 +691,11 @@ pass "OpenCode collector keeps only current, account-specific limit caches"
   [[ $(jq -r '.cacheLimits.corrupt' <<<"$result") == "3" ]]; } ||
   fail "OpenCode collector separates entitlement, account, and corrupt-cache failures" "$result"
 pass "OpenCode collector separates entitlement, account, and corrupt-cache failures"
+
+{ [[ $(jq -c '.cacheLimits.serverError' <<<"$result") == '["Weekly (7-day)"]' ]] &&
+  [[ $(jq -r '.cacheLimits.serverErrorRetry' <<<"$result") == "null" ]]; } ||
+  fail "OpenCode collector keeps cached windows and withholds retry on a 500" "$result"
+pass "OpenCode collector keeps cached windows and withholds retry on a 500"
 
 { [[ $(jq -r '.probe.url' <<<"$result") == \
     "https://example.invalid/zen/go/v1/usage" ]] &&

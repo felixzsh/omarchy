@@ -96,11 +96,13 @@ def opencode_db_path() -> Path | None:
   if configured:
     configured_path = Path(configured).expanduser()
     return (configured_path if configured_path.is_absolute() else root / configured_path).resolve()
-  v2 = root / "opencode-v2.db"
-  if v2.is_file():
-    return v2
   normal = root / "opencode.db"
-  return normal if normal.is_file() else None
+  if normal.is_file():
+    return normal
+  # Only a build whose channel was literally "v2" wrote this name; current
+  # releases use opencode.db, so it remains a fallback for older installs.
+  legacy = root / "opencode-v2.db"
+  return legacy if legacy.is_file() else None
 
 
 def parse_usage_message(
@@ -737,7 +739,7 @@ def collect_limits(
       if error.auth or error.entitlement:
         refused = (error, fallback, candidate.expired)
         continue
-      if error.transport or error.retry:
+      if error.transport:
         result["retryAdvised"] = True
       if fallback:
         result["limits"] = fallback
